@@ -1,0 +1,121 @@
+{
+    "name": "LEGO Deals (Manual → Email)",
+    "nodes": [
+      {
+        "id": "Manual",
+        "name": "Manual Trigger",
+        "type": "n8n-nodes-base.manualTrigger",
+        "typeVersion": 1,
+        "position": [-900, 0],
+        "parameters": {}
+      },
+      {
+        "id": "Config",
+        "name": "Config (edit me)",
+        "type": "n8n-nodes-base.function",
+        "typeVersion": 2,
+        "position": [-700, 0],
+        "parameters": {
+          "functionCode": "// ---- User config ----\nconst emailTo = \"you@example.com\";   // <--- CHANGE THIS\nconst minDiscountPct = 15;             // ignore deals < 15%\nconst keywords = [\"LEGO\", \"Technic\", \"Star Wars\", \"Icons\", \"Harry Potter\", \"Speed Champions\", \"Nintendo\"];\n\nreturn [\n  { json: { type: 'rss',    name: 'Slickdeals LEGO',    url: 'https://slickdeals.net/newsearch.php?src=SearchBarV2&q=lego&searcharea=deals&searchin=first&rss=1', emailTo, minDiscountPct, keywords } },\n  { json: { type: 'reddit', name: 'Reddit r/lego_deals', url: 'https://www.reddit.com/r/lego_deals/.json', emailTo, minDiscountPct, keywords } }\n];"
+        }
+      },
+      {
+        "id": "Fetch",
+        "name": "HTTP Request (Fetch Source)",
+        "type": "n8n-nodes-base.httpRequest",
+        "typeVersion": 4,
+        "position": [-480, 0],
+        "parameters": {
+          "url": "={{$json.url}}",
+          "options": {
+            "response": "string",
+            "batchInterval": 200
+          }
+        }
+      },
+      {
+        "id": "Parse",
+        "name": "Function (Parse & Normalize)",
+        "type": "n8n-nodes-base.function",
+        "typeVersion": 2,
+        "position": [-240, 0],
+        "parameters": {
+          "functionCode": "// Output fields per deal: {title, url, source, price, percentOff, metaScore}\nconst out = [];\nfor (const it of items) {\n  const srcType = it.json.type;\n  const srcName = it.json.name;\n  const raw = it.binary?.data ? Buffer.from(it.binary.data.data, 'base64').toString('utf8') : String(it.json.data || it.json || '');\n\n  if (srcType === 'rss') {\n    const entries = raw.split(/<item>/i).slice(1);\n    for (const e of entries) {\n      const title = (e.match(/<title><!\\[CDATA\\[(.*?)\\]\\]><\\/title>/i) || e.match(/<title>(.*?)<\\/title>/i) || [,''])[1];\n      const link  = (e.match(/<link>(.*?)<\\/link>/i) || [,''])[1];\n      const desc  = (e.match(/<description><!\\[CDATA\\[(.*?)\\]\\]><\\/description>/si) || [,''])[1];\n      const text  = `${title||''} ${desc||''}`;\n      const priceMatch = text.match(/\\$([0-9]+(?:\\.[0-9]{1,2})?)/);\n      const pctMatch   = text.match(/([0-9]{1,2}|100)\\s?%\\s?off/i);\n      out.push({ json: { title: (title||'').trim() || '(no title)', url: (link||'').trim(), source: srcName, price: priceMatch ? parseFloat(priceMatch[1]) : null, percentOff: pctMatch ? parseFloat(pctMatch[1]) : null, metaScore: 0 } });\n    }\n  }\n\n  if (srcType === 'reddit') {\n    let data; try { data = JSON.parse(raw); } catch { data = null; }\n    const posts = data?.data?.children || [];\n    for (const p of posts) {\n      const t = p.data || {};\n      const title = t.title || '';\n      const url = t.url_overridden_by_dest || (t.permalink ? `https://www.reddit.com${t.permalink}` : '');\n      const text = `${title} ${t.selftext || ''}`;\n      const priceMatch = text.match(/\\$([0-9]+(?:\\.[0-9]{1,2})?)/);\n      const pctMatch   = text.match(/([0-9]{1,2}|100)\\s?%\\s?off/i);\n      const score      = typeof t.score === 'number' ? t.score : 0;\n      out.push({ json: { title, url, source: srcName, price: priceMatch ? parseFloat(priceMatch[1]) : null, percentOff: pctMatch ? parseFloat(pctMatch[1]) : null, metaScore: score } });\n    }\n  }\n}\nreturn out.length ? out : [{ json: { _note: 'No items parsed' } }];"
+        }
+      },
+      {
+        "id": "Rank",
+        "name": "Function (Filter, Score, Rank)",
+        "type": "n8n-nodes-base.function",
+        "typeVersion": 2,
+        "position": [-20, 0],
+        "parameters": {
+          "functionCode": "const cfg = $items(\"Config\", 0, 0)[0]?.json || {};\nconst emailTo = cfg.emailTo || 'you@example.com';\nconst minDiscountPct = cfg.minDiscountPct ?? 15;\nconst keywords = cfg.keywords || [\"LEGO\"];\n\nconst raw = items.map(i => i.json).filter(r => r && (r.title || r.url));\nconst seen = new Set();\nconst deduped = [];\nfor (const r of raw) {\n  const key = (r.url || r.title).toLowerCase();\n  if (!seen.has(key)) { seen.add(key); deduped.push(r); }\n}\n\nconst kwRegex = new RegExp(keywords.map(k => k.replace(/[-/\\\\^$*+?.()|[\\]{}]/g, '\\\\$&')).join('|'), 'i');\nconst legoOnly = deduped.filter(r => kwRegex.test(r.title || ''));\n\nconst filtered = legoOnly.filter(r => (r.percentOff == null) ? true : (r.percentOff >= minDiscountPct));\n\nfor (const r of filtered) {\n  const pct = (typeof r.percentOff === 'number') ? r.percentOff : 0;\n  r.rankScore = (pct * 2) + ((r.metaScore || 0) * 0.05);\n}\nfiltered.sort((a,b) => (b.rankScore||0) - (a.rankScore||0));\n\nconst top = filtered.slice(0, 5);\nconst linesText = top.map((d, i) => {\n  const pct = (d.percentOff != null) ? `${d.percentOff.toFixed(0)}% off` : '—';\n  const price = (d.price != null) ? `$${d.price.toFixed(2)}` : '—';\n  return `${i+1}. ${d.title}\\n   ${d.url}\\n   ${pct} | ${price} | ${d.source}`;\n}).join('\\n\\n');\n\nconst linesHtml = top.map((d, i) => {\n  const pct = (d.percentOff != null) ? `${d.percentOff.toFixed(0)}% off` : '—';\n  const price = (d.price != null) ? `$${d.price.toFixed(2)}` : '—';\n  const safeTitle = (d.title || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');\n  return `<p><strong>${i+1}. <a href=\\\"${d.url}\\\">${safeTitle}</a></strong><br>${pct} | ${price} | ${d.source}</p>`;\n}).join('');\n\nconst date = new Date().toLocaleString('en-US', { timeZone: 'America/New_York' });\n\nreturn [{ json: { date, emailTo, minDiscountPct, numResults: top.length, dealsText: linesText, dealsHtml: linesHtml } }];"
+        }
+      },
+      {
+        "id": "IfNode",
+        "name": "IF (Deals found?)",
+        "type": "n8n-nodes-base.if",
+        "typeVersion": 1,
+        "position": [200, 0],
+        "parameters": {
+          "conditions": {
+            "number": [
+              { "value1": "={{$json.numResults}}", "operation": "larger", "value2": 0 }
+            ]
+          }
+        }
+      },
+      {
+        "id": "GmailYes",
+        "name": "Gmail (Send Deals)",
+        "type": "n8n-nodes-base.gmail",
+        "typeVersion": 2,
+        "position": [440, -60],
+        "parameters": {
+          "toList": "={{$json.emailTo}}",
+          "additionalFields": {
+            "subject": "={{`LEGO Deals Today (${ $json.date })`}}",
+            "text": "={{`Good morning!\\n\\nHere are today’s top LEGO deals (min ${$json.minDiscountPct}% off when available):\\n\\n${$json.dealsText}\\n\\nNote: Always verify price, stock, and shipping. Not financial advice.\\n— n8n bot`}}",
+            "html": "={{`<div><p>Good morning!</p><p>Here are today’s top LEGO deals (min ${$json.minDiscountPct}% off when available):</p>${$json.dealsHtml}<p><em>Note: Always verify price, stock, and shipping. Not financial advice.</em><br>— n8n bot</p></div>`}}"
+          }
+        },
+        "credentials": {
+          "gmailOAuth2": { "id": "", "name": "" }
+        }
+      },
+      {
+        "id": "GmailNo",
+        "name": "Gmail (No Deals Today)",
+        "type": "n8n-nodes-base.gmail",
+        "typeVersion": 2,
+        "position": [440, 80],
+        "parameters": {
+          "toList": "={{$json.emailTo}}",
+          "additionalFields": {
+            "subject": "={{`LEGO Deals Today (${ $json.date })`}}",
+            "text": "={{`Good morning!\\n\\nNo qualifying LEGO deals found today (threshold ${$json.minDiscountPct}%).\\nYou can tweak keywords or lower the threshold in the Config node.\\n— n8n bot`}}"
+          }
+        },
+        "credentials": {
+          "gmailOAuth2": { "id": "", "name": "" }
+        }
+      }
+    ],
+    "connections": {
+      "Manual Trigger": { "main": [[{ "node": "Config (edit me)", "type": "main", "index": 0 }]] },
+      "Config (edit me)": { "main": [[{ "node": "HTTP Request (Fetch Source)", "type": "main", "index": 0 }]] },
+      "HTTP Request (Fetch Source)": { "main": [[{ "node": "Function (Parse & Normalize)", "type": "main", "index": 0 }]] },
+      "Function (Parse & Normalize)": { "main": [[{ "node": "Function (Filter, Score, Rank)", "type": "main", "index": 0 }]] },
+      "Function (Filter, Score, Rank)": { "main": [[{ "node": "IF (Deals found?)", "type": "main", "index": 0 }]] },
+      "IF (Deals found?)": {
+        "main": [
+          [{ "node": "Gmail (Send Deals)", "type": "main", "index": 0 }],
+          [{ "node": "Gmail (No Deals Today)", "type": "main", "index": 0 }]
+        ]
+      }
+    },
+    "meta": { "templateCredsSetup": true }
+  }
+  
